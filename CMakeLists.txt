@@ -42,7 +42,19 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
   set(OS "linux")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
-  set(OS_LIBS pthread rt)
+
+  # Add support for AF_XDP libraries
+  find_library(BPF_LIBRARY bpf)
+  find_library(XDP_LIBRARY xdp)
+
+  if(BPF_LIBRARY AND XDP_LIBRARY)
+    message(STATUS "Found BPF library: ${BPF_LIBRARY}")
+    message(STATUS "Found XDP library: ${XDP_LIBRARY}")
+    set(OS_LIBS pthread rt ${BPF_LIBRARY} ${XDP_LIBRARY})
+  else()
+    message(WARNING "BPF or XDP library not found. Please install libbpf-dev and libxdp-dev.")
+    set(OS_LIBS pthread rt)
+  endif()
 elseif(APPLE)
   # This must come *before* linux or MacOSX will identify as Unix.
   set(OS "macosx")

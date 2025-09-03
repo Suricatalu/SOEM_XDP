@@ -47,28 +47,6 @@
 #include "oshw.h"
 #include "osal.h"
 
-// #include <string.h>
-// #include <net/if.h>
-// #include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-// #include <unistd.h>
-#include "af_xdp_lib.h"
-
-
-
-static volatile bool global_exit = false;
-struct af_xdp_context *ctx;
-uint64_t addrs[RX_BATCH_SIZE];
-uint32_t lens[RX_BATCH_SIZE];
-
-static void int_exit(int sig)
-{
-   if (sig == SIGINT || sig == SIGTERM) {
-    global_exit = true;
-   }
-}
-
 /** Redundancy modes */
 enum
 {
@@ -112,43 +90,12 @@ static void ecx_clear_rxbufstat(int *rxbufstat)
 int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
 {
    int i;
-   int r, rval;
+   int r, rval, ifindex;
+   struct timeval timeout;
+   struct ifreq ifr;
+   struct sockaddr_ll sll;
    int *psock;
    pthread_mutexattr_t mutexattr;
-
-   ctx = af_xdp_init();
-   if (!ctx) {
-      printf("[ERROR] %s: Failed to initialize AF_XDP context\n", __func__);
-      return -1;
-   }
-
-   printf("[INFO] %s: AF_XDP context initialized (ctx=%p)\n", __func__, ctx);
-
-   // 設置信號處理
-   signal(SIGINT, int_exit);
-   signal(SIGTERM, int_exit);
-
-   ctx->cfg.ifindex = if_nametoindex(ifname);
-   if (ctx->cfg.ifindex == 0) {
-      printf("[ERROR] %s: Interface '%s' not found\n", __func__, ifname);
-      af_xdp_cleanup(ctx);
-      return -1;
-   }
-   ctx->cfg.ifname = malloc(10);
-   strncpy(ctx->cfg.ifname, ifname, sizeof(ctx->cfg.ifname) - 1);
-   printf("[INFO] %s: Interface name set to: %s (idx: %d)\n", __func__, ctx->cfg.ifname, ctx->cfg.ifindex);
-
-   // Initialize other necessary configurations
-   ctx->cfg.xdp_flags = 0;
-   ctx->cfg.xsk_bind_flags = 0;
-   ctx->cfg.xsk_if_queue = 0;
-   ctx->cfg.xsk_poll_mode = true;
-
-   // Optional: xdp-loader for af_xdp_kern.o
-   // printf("Setting up XDP program...\n");
-   // if (af_xdp_setup_program(ctx, "af_xdp_kern.o", "xdp_sock_prog") < 0) {
-   //    fprintf(stderr, "WARNING: Failed to setup XDP program, continuing without custom program\n");
-   // }
 
    rval = 0;
    if (secondary)
@@ -177,9 +124,9 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    }
    else
    {
-      pthread_mutexattr_init(&mutexattr);
-      /* Not all platforms define PTHREAD_PRIO_INHERIT; skip setprotocol to keep portability */
-      printf("[nicdrv] %s: skipping pthread_mutexattr_setprotocol (platform portability)\n", __func__);
+   pthread_mutexattr_init(&mutexattr);
+   /* Not all platforms define PTHREAD_PRIO_INHERIT; skip setprotocol to keep portability */
+   printf("[nicdrv_legacy] %s: skipping pthread_mutexattr_setprotocol (platform portability)\n", __func__);
       pthread_mutex_init(&(port->getindex_mutex), &mutexattr);
       pthread_mutex_init(&(port->tx_mutex)      , &mutexattr);
       pthread_mutex_init(&(port->rx_mutex)      , &mutexattr);
@@ -197,19 +144,34 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       psock = &(port->sockhandle);
    }
    /* we use RAW packet socket, with packet type ETH_P_ECAT */
-   if (af_xdp_setup_socket(ctx) < 0) {
-      printf("[ERROR] %s: Failed to setup AF_XDP socket\n", __func__);
-      af_xdp_cleanup(ctx);
-      return -1;
-   }
-   printf("[INFO] %s: af_xdp_setup_socket succeeded xsk_socket=%p umem=%p\n", __func__, ctx->xsk_socket, ctx->umem);
-
-   *psock = xsk_socket__fd(ctx->xsk_socket->xsk); // Use accessor function to get the file descriptor
+   *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
    if(*psock < 0)
       return 0;
-   printf("[INFO] %s: assigned socket fd=%d to psock (%p)\n", __func__, *psock, psock);
 
+   timeout.tv_sec =  0;
+   timeout.tv_usec = 1;
    r = 0;
+   r |= setsockopt(*psock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+   r |= setsockopt(*psock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+   i = 1;
+   r |= setsockopt(*psock, SOL_SOCKET, SO_DONTROUTE, &i, sizeof(i));
+   /* connect socket to NIC by name */
+   strcpy(ifr.ifr_name, ifname);
+   r |= ioctl(*psock, SIOCGIFINDEX, &ifr);
+   ifindex = ifr.ifr_ifindex;
+   strcpy(ifr.ifr_name, ifname);
+   ifr.ifr_flags = 0;
+   /* reset flags of NIC interface */
+   r |= ioctl(*psock, SIOCGIFFLAGS, &ifr);
+   /* set flags of NIC interface, here promiscuous and broadcast */
+   ifr.ifr_flags = ifr.ifr_flags | IFF_PROMISC | IFF_BROADCAST;
+   r |= ioctl(*psock, SIOCSIFFLAGS, &ifr);
+   /* bind socket to protocol, in this case RAW EtherCAT */
+   sll.sll_family = AF_PACKET;
+   sll.sll_ifindex = ifindex;
+   sll.sll_protocol = htons(ETH_P_ECAT);
+   r |= bind(*psock, (struct sockaddr *)&sll, sizeof(sll));
+   /* setup ethernet headers in tx buffers so we don't have to repeat it */
    for (i = 0; i < EC_MAXBUF; i++)
    {
       ec_setupheader(&(port->txbuf[i]));
@@ -228,11 +190,9 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
 int ecx_closenic(ecx_portt *port)
 {
    if (port->sockhandle >= 0)
-      af_xdp_cleanup(ctx);
+      close(port->sockhandle);
    if ((port->redport) && (port->redport->sockhandle >= 0))
-      af_xdp_cleanup(ctx);
-
-   printf("[INFO] %s: closed AF_XDP context\n", __func__);
+      close(port->redport->sockhandle);
 
    return 0;
 }
@@ -326,21 +286,13 @@ int ecx_outframe(ecx_portt *port, uint8 idx, int stacknumber)
    }
    lp = (*stack->txbuflength)[idx];
    (*stack->rxbufstat)[idx] = EC_BUF_TX;
-
-   /* Sanity check: ensure AF_XDP context is available */
-   if (!ctx || !ctx->xsk_socket) {
-      printf("[ERROR] %s: AF_XDP context is not available (ctx=%p xsk_socket=%p)\n", __func__, ctx, ctx ? ctx->xsk_socket : NULL);
-      return -1;
+   rval = send(*stack->sock, (*stack->txbuf)[idx], lp, 0);
+   if (rval == -1)
+   {
+      (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
    }
 
-   /* Use the abstracted send API to avoid duplicate frame management logic */
-   rval = af_xdp_send(ctx->xsk_socket, (*stack->txbuf)[idx], (size_t)lp, AF_XDP_SEND_F_FLUSH);
-   if (rval != 0) {
-      printf("[ERROR] %s: af_xdp_send failed idx=%u lp=%d rval=%d\n", __func__, idx, lp, rval);
-      return -1;
-   }
-
-   return 0;
+   return rval;
 }
 
 /** Transmit buffer over socket (non blocking).
@@ -388,21 +340,8 @@ int ecx_outframe_red(ecx_portt *port, uint8 idx)
  */
 static int ecx_recvpkt(ecx_portt *port, int stacknumber)
 {
-   int bytesrx;
+   int lp, bytesrx;
    ec_stackT *stack;
-   int* returnSize = malloc(sizeof(unsigned int));
-   int** returnColumnSizes = malloc(sizeof(unsigned int*) * RX_BATCH_SIZE);
-   unsigned char** returnData;
-   static int tcnt = 0;
-
-   tcnt++;
-
-   for (int i = 0; i < RX_BATCH_SIZE; i++) {
-      returnColumnSizes[i] = malloc(sizeof(unsigned int));
-   }
-
-   // show the number of line of this function and file
-   // printf("[nicdrv] %s: ecx_recvpkt called (%d) => ctx=%p xsk_socket=%p\n", __func__, tcnt, ctx, ctx ? ctx->xsk_socket : NULL);
 
    if (!stacknumber)
    {
@@ -412,29 +351,10 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
    {
       stack = &(port->redport->stack);
    }
+   lp = sizeof(port->tempinbuf);
+   bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+   port->tempinbufs = bytesrx;
 
-   returnData = af_xdp_receive(ctx, returnSize, returnColumnSizes, RX_BATCH_SIZE);
-   if (!returnData) {
-      // printf("[DEBUG] %s: af_xdp_receive returned NULL (no packets)\n", __func__);
-      bytesrx = 0;
-   } else {
-      for (int i = 0; i < *returnSize; i++) {
-         uint32_t len = *returnColumnSizes[i];
-         /* Copy from bounce buffer into local tempinbuf */
-         memcpy(port->tempinbuf, returnData[i], len);
-         /* Point stack->tempbuf to local buffer */
-         stack->tempbuf = (uint8 (*)[EC_BUFSIZE]) &port->tempinbuf;
-         port->tempinbufs = len;
-         bytesrx = len;
-         /* Free bounce buffer */
-         free(returnData[i]);
-      }
-   }
-
-   if (returnData) free(returnData);
-   for (int i = 0; i < RX_BATCH_SIZE; i++) if (returnColumnSizes[i]) free(returnColumnSizes[i]);
-   free(returnColumnSizes);
-   free(returnSize);
    return (bytesrx > 0);
 }
 
@@ -463,8 +383,6 @@ int ecx_inframe(ecx_portt *port, uint8 idx, int stacknumber)
    ec_comt *ecp;
    ec_stackT *stack;
    ec_bufT *rxbuf;
-
-   // printf("ecx_inframe get called\n");
 
    if (!stacknumber)
    {
