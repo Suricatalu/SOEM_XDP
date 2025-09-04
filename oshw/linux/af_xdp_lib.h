@@ -85,11 +85,19 @@ void af_xdp_complete_tx(struct xsk_socket_info *xsk);
 /* New API: send one packet (reserve tx slot, submit descriptor, update stats) */
 int af_xdp_ready_send(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len);
 
-/* New API: receive up to max_entries, fill user-provided addrs and lens arrays */
-unsigned char** af_xdp_receive(struct af_xdp_context *ctx, 
-								   int* returnSize, 
-								   int** returnColumnSizes, 
-								   unsigned int max_entries);
+/* New API: receive up to max_entries. Caller MUST provide an array of
+ * pre-allocated buffers in "out_buffers" with capacities in
+ * "out_buffer_caps". The function will memcpy packet data into
+ * out_buffers[i] and set returnColumnSizes[i][0] to the copied length.
+ * Returns number of packets received (rcvd) or 0 if none. This function
+ * will NOT allocate per-packet buffers.
+ */
+int af_xdp_receive(struct af_xdp_context *ctx,
+				   int *returnSize,
+				   int **returnColumnSizes,
+				   unsigned int max_entries,
+				   unsigned char **out_buffers,
+				   unsigned int *out_buffer_caps);
 
 /* 新增: 高階封裝，一次送出一個資料緩衝 */
 int af_xdp_send(struct xsk_socket_info *xsk, const void *data, size_t len, uint32_t flags);

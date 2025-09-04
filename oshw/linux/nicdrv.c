@@ -388,21 +388,22 @@ int ecx_outframe_red(ecx_portt *port, uint8 idx)
  */
 static int ecx_recvpkt(ecx_portt *port, int stacknumber)
 {
-   int bytesrx;
+   int bytesrx = 0;
    ec_stackT *stack;
-   int* returnSize = malloc(sizeof(unsigned int));
-   int** returnColumnSizes = malloc(sizeof(unsigned int*) * RX_BATCH_SIZE);
-   unsigned char** returnData;
-   static int tcnt = 0;
+   /* We only expect at most one packet per call. Use a single pre-allocated
+    * bounce buffer and single column-size storage to avoid bulk allocations. */
+   int retSize = 0;
+   int *retSizePtr = &retSize;
+   int colSize = 0;
+   int *colSizePtr = &colSize;
+   int **retColSizes = &colSizePtr; /* array of one int* */
+   unsigned char singleBuf[EC_BUFSIZE]; /* stack bounce buffer for one packet */
+   unsigned char *retBufPtr = singleBuf;
+   unsigned char **retBufs = &retBufPtr; /* array of one unsigned char* */
+   unsigned int bufCap = EC_BUFSIZE;
+   unsigned int *retBufCaps = &bufCap; /* array of one unsigned int */
 
-   tcnt++;
-
-   for (int i = 0; i < RX_BATCH_SIZE; i++) {
-      returnColumnSizes[i] = malloc(sizeof(unsigned int));
-   }
-
-   // show the number of line of this function and file
-   // printf("[nicdrv] %s: ecx_recvpkt called (%d) => ctx=%p xsk_socket=%p\n", __func__, tcnt, ctx, ctx ? ctx->xsk_socket : NULL);
+   // show the number of line of this function and file (debug removed tcnt)
 
    if (!stacknumber)
    {
@@ -413,28 +414,21 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       stack = &(port->redport->stack);
    }
 
-   returnData = af_xdp_receive(ctx, returnSize, returnColumnSizes, RX_BATCH_SIZE);
-   if (!returnData) {
-      // printf("[DEBUG] %s: af_xdp_receive returned NULL (no packets)\n", __func__);
+   /* Call new af_xdp_receive variant: pass single pre-allocated bounce buffer */
+   int rcvd = af_xdp_receive(ctx, retSizePtr, retColSizes, 1, retBufs, retBufCaps);
+   if (rcvd <= 0) {
       bytesrx = 0;
    } else {
-      for (int i = 0; i < *returnSize; i++) {
-         uint32_t len = *returnColumnSizes[i];
-         /* Copy from bounce buffer into local tempinbuf */
-         memcpy(port->tempinbuf, returnData[i], len);
-         /* Point stack->tempbuf to local buffer */
-         stack->tempbuf = (uint8 (*)[EC_BUFSIZE]) &port->tempinbuf;
-         port->tempinbufs = len;
-         bytesrx = len;
-         /* Free bounce buffer */
-         free(returnData[i]);
-      }
+      /* Only one entry possible */
+      uint32_t len = retColSizes[0][0];
+      /* Copy from bounce buffer into local tempinbuf */
+      memcpy(port->tempinbuf, retBufs[0], len);
+      /* Point stack->tempbuf to local buffer */
+      stack->tempbuf = (uint8 (*)[EC_BUFSIZE]) &port->tempinbuf;
+      port->tempinbufs = len;
+      bytesrx = len;
    }
 
-   if (returnData) free(returnData);
-   for (int i = 0; i < RX_BATCH_SIZE; i++) if (returnColumnSizes[i]) free(returnColumnSizes[i]);
-   free(returnColumnSizes);
-   free(returnSize);
    return (bytesrx > 0);
 }
 

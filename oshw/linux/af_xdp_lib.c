@@ -254,58 +254,67 @@ int af_xdp_ready_send(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 }
 
 /* Receive batch: peek RX ring, refill fill-ring, and copy addr/len into user arrays */
-unsigned char** af_xdp_receive(struct af_xdp_context *ctx, int* returnSize, int** returnColumnSizes, unsigned int max_entries)
+int af_xdp_receive(struct af_xdp_context *ctx, int* retSize, int** retColSizes, unsigned int max_entries, unsigned char **retBufs, unsigned int *retBufCaps)
 {
-    uint32_t idx_rx = 0;
-    uint64_t* addrs = malloc(sizeof(uint64_t) * max_entries);
-    uint32_t* lens = malloc(sizeof(uint32_t) * max_entries);
-    unsigned char** ret = malloc(sizeof(unsigned char*) * max_entries);
+	uint32_t idx_rx = 0;
+	uint64_t* addrs = NULL;
 
-    *returnSize = 0;
-    for (int i = 0; i < (int) max_entries; i++)
-        returnColumnSizes[i][0] = 0;
-    
-    unsigned int rcvd = xsk_ring_cons__peek(&ctx->xsk_socket->rx, max_entries, &idx_rx);
-    if (!rcvd) {
-        // printf("[DEBUG] %s: No packets received (rcvd=0)\n", __func__);
-        free(addrs);
-        free(lens);
-        free(ret);
-        *returnSize = 0;
-        return NULL;
-    }
-    *returnSize = rcvd;
-    // printf("[af_xdp_lib] %s: rcvd=%u, max_entries=%u\n", __func__, rcvd, max_entries);
+	if (!ctx || !ctx->xsk_socket || !retSize || !retColSizes || !retBufs || !retBufCaps)
+		return -EINVAL;
 
-    // Copy out packet data to bounce buffers and record addrs
-    for (unsigned int i = 0; i < rcvd; i++) {
-        uint64_t addr = xsk_ring_cons__rx_desc(&ctx->xsk_socket->rx, idx_rx)->addr;
-        uint32_t len  = xsk_ring_cons__rx_desc(&ctx->xsk_socket->rx, idx_rx++)->len;
-        void* src = xsk_umem__get_data(ctx->xsk_socket->umem->buffer, addr);
-        ret[i] = malloc(len);
-        memcpy(ret[i], src, len);
-        returnColumnSizes[i][0] = len;
-        addrs[i] = addr;
-        // printf("[af_xdp_lib] %s: packet[%u] addr=%llu len=%u data_copied=0x%p\n", __func__, i, (unsigned long long)addr, len, ret[i]);
-    }
-    xsk_ring_cons__release(&ctx->xsk_socket->rx, rcvd);
+	*retSize = 0;
+	for (unsigned int i = 0; i < max_entries; i++)
+		retColSizes[i][0] = 0;
 
-    // Refill fill-queue with the same frame addrs to prevent UMEM exhaustion
-    {
-        uint32_t idx_fq = 0;
-        int reserved = xsk_ring_prod__reserve(&ctx->xsk_socket->umem->fq, rcvd, &idx_fq);
-        if (reserved == (int)rcvd) {
-            for (unsigned int j = 0; j < rcvd; j++)
-                *xsk_ring_prod__fill_addr(&ctx->xsk_socket->umem->fq, idx_fq++) = addrs[j];
-            xsk_ring_prod__submit(&ctx->xsk_socket->umem->fq, rcvd);
-        } else {
-            printf("[ERROR] %s: FQ refill failed, reserved=%d expected=%u\n", __func__, reserved, rcvd);
-        }
-    }
+	unsigned int rcvd = xsk_ring_cons__peek(&ctx->xsk_socket->rx, max_entries, &idx_rx);
+	if (!rcvd) {
+		*retSize = 0;
+		return 0;
+	}
+	*retSize = rcvd;
 
-    free(addrs);
-    free(lens);
-    return ret;
+	addrs = malloc(sizeof(uint64_t) * rcvd);
+	if (!addrs) {
+		printf("[ERROR] %s: failed to allocate addrs buffer\n", __func__);
+		xsk_ring_cons__release(&ctx->xsk_socket->rx, rcvd);
+		*retSize = 0;
+		return -ENOMEM;
+	}
+
+	/* Copy out packet data to caller-provided bounce buffers and record addrs */
+	for (unsigned int i = 0; i < rcvd; i++) {
+		uint64_t addr = xsk_ring_cons__rx_desc(&ctx->xsk_socket->rx, idx_rx)->addr;
+		uint32_t len  = xsk_ring_cons__rx_desc(&ctx->xsk_socket->rx, idx_rx++)->len;
+		void* src = xsk_umem__get_data(ctx->xsk_socket->umem->buffer, addr);
+
+		/* Ensure caller provided buffer is large enough */
+		if (retBufCaps[i] < len) {
+			/* If not enough space, copy as much as fits and set reported length to shrinked size */
+			memcpy(retBufs[i], src, retBufCaps[i]);
+			retColSizes[i][0] = retBufCaps[i];
+		} else {
+			memcpy(retBufs[i], src, len);
+			retColSizes[i][0] = len;
+		}
+		addrs[i] = addr;
+	}
+	xsk_ring_cons__release(&ctx->xsk_socket->rx, rcvd);
+
+	/* Refill fill-queue with the same frame addrs to prevent UMEM exhaustion */
+	{
+		uint32_t idx_fq = 0;
+		int reserved = xsk_ring_prod__reserve(&ctx->xsk_socket->umem->fq, rcvd, &idx_fq);
+		if (reserved == (int)rcvd) {
+			for (unsigned int j = 0; j < rcvd; j++)
+				*xsk_ring_prod__fill_addr(&ctx->xsk_socket->umem->fq, idx_fq++) = addrs[j];
+			xsk_ring_prod__submit(&ctx->xsk_socket->umem->fq, rcvd);
+		} else {
+			printf("[ERROR] %s: FQ refill failed, reserved=%d expected=%u\n", __func__, reserved, rcvd);
+		}
+	}
+
+	free(addrs);
+	return (int)rcvd;
 }
 
 
