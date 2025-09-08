@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <xdp/xsk.h>
 #include <xdp/libxdp.h>
+#include <linux/types.h>
 #include "../common/common_params.h"
 
 #define NUM_FRAMES         4096
@@ -92,12 +93,11 @@ int af_xdp_ready_send(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len);
  * Returns number of packets received (rcvd) or 0 if none. This function
  * will NOT allocate per-packet buffers.
  */
-int af_xdp_receive(struct af_xdp_context *ctx,
-				   int *returnSize,
-				   int **returnColumnSizes,
+int af_xdp_receive(struct af_xdp_context *ctx, 
+				   unsigned char *buf, 
+				   unsigned int buf_len, 
 				   unsigned int max_entries,
-				   unsigned char **out_buffers,
-				   unsigned int *out_buffer_caps);
+				   int (*func)(unsigned char *buf, unsigned int buf_len, unsigned int ret_len));
 
 /* 新增: 高階封裝，一次送出一個資料緩衝 */
 int af_xdp_send(struct xsk_socket_info *xsk, const void *data, size_t len, uint32_t flags);
